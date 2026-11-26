@@ -1,3 +1,20 @@
+# Environment variables
 .env
+
+# Python virtual environment
 venv/
+.venv/
+
+# Python cache
 __pycache__/
+*.pyc
+backend/__pycache__/
+
+# Generated RAG indexes
+faiss_index.index
+chunk_records.json
+
+# Frontend dependencies
+frontend/node_modules/
+frontend/dist/
+backend/profile.json

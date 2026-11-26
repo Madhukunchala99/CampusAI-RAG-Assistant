@@ -1,11 +1,21 @@
 
 import os
 import re
+import gc
 import json
 from pathlib import Path
 
+# ============================================================
+# MEMORY OPTIMIZATION SETTINGS
+# ============================================================
+
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["MKL_NUM_THREADS"] = "1"
+
 import numpy as np
 import faiss
+import torch
 
 from rank_bm25 import BM25Okapi
 from pypdf import PdfReader
@@ -24,8 +34,10 @@ PDF_PATH = ROOT_DIR / "documents" / "College_Regulations_and_Student_Data.pdf"
 UPLOAD_DIR = ROOT_DIR / "documents" / "uploads"
 
 INDEX_PATH = ROOT_DIR / "faiss_index.index"
-ENV_PATH = ROOT_DIR / ".env"
+RECORDS_PATH = ROOT_DIR / "chunk_records.json"
+
 PROFILE_PATH = ROOT_DIR / "backend" / "profile.json"
+ENV_PATH = ROOT_DIR / ".env"
 
 UPLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -43,23 +55,25 @@ GROQ_MODEL = "openai/gpt-oss-120b"
 TOP_K = 4
 CHUNK_SIZE = 500
 CHUNK_OVERLAP = 50
-
 MIN_SEMANTIC_SCORE = 0.35
-STRONG_SEMANTIC_SCORE = 0.50
+BATCH_SIZE = 8
+
+try:
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass
+
+model = None
+index = None
+bm25 = None
+
+chunk_records = []
+profile_data = {}
 
 
 # ============================================================
-# STEP 2: LOAD PROFILE
-# ============================================================
-
-with open(PROFILE_PATH, "r", encoding="utf-8") as file:
-    PROFILE_DATA = json.load(file)
-
-print("Personal profile loaded successfully!")
-
-
-# ============================================================
-# STEP 3: TEXT NORMALIZATION
+# STEP 2: TEXT PROCESSING
 # ============================================================
 
 def normalize_text(text):
@@ -67,27 +81,62 @@ def normalize_text(text):
 
 
 def tokenize(text):
-    return re.findall(r"\b[\w.%-]+\b", normalize_text(text))
+    return re.findall(r"\b\w+\b", text.lower())
 
 
 # ============================================================
-# STEP 4: PDF CHUNKING
+# STEP 3: LOAD STUDENT PROFILE
 # ============================================================
 
-def create_chunks(pdf_path: Path, source_filename: str):
+def load_profile():
+    global profile_data
 
-    pdf = PdfReader(str(pdf_path))
+    if PROFILE_PATH.exists():
+        try:
+            with open(PROFILE_PATH, "r", encoding="utf-8") as file:
+                profile_data = json.load(file)
 
-    chunk_records = []
+        except (OSError, json.JSONDecodeError) as error:
+            print("Profile loading error:", error)
+            profile_data = {}
 
-    for page_number, page in enumerate(pdf.pages, start=1):
 
-        page_text = page.extract_text()
+# ============================================================
+# STEP 4: LAZY LOAD EMBEDDING MODEL
+# ============================================================
 
-        if not page_text:
-            continue
+def get_model():
+    global model
 
-        page_text = page_text.strip()
+    if model is None:
+        print("Loading embedding model...")
+
+        model = SentenceTransformer(
+            "all-MiniLM-L6-v2",
+            device="cpu"
+        )
+
+        model.max_seq_length = 256
+
+        print("Embedding model loaded successfully!")
+
+    return model
+
+
+# ============================================================
+# STEP 5: PDF EXTRACTION AND CHUNKING
+# ============================================================
+
+def create_chunks(pdf_path, source_filename):
+
+    records = []
+
+    reader = PdfReader(str(pdf_path))
+
+    for page_number, page in enumerate(reader.pages, start=1):
+
+        page_text = page.extract_text() or ""
+        page_text = " ".join(page_text.split())
 
         start = 0
 
@@ -95,843 +144,611 @@ def create_chunks(pdf_path: Path, source_filename: str):
 
             end = start + CHUNK_SIZE
 
-            chunk_text = page_text[start:end].strip()
+            chunk = page_text[start:end].strip()
 
-            if chunk_text:
-
-                chunk_records.append({
-                    "chunk_id": len(chunk_records),
-                    "filename": source_filename,
-                    "page": page_number,
-                    "text": chunk_text
+            if chunk:
+                records.append({
+                    "text": chunk,
+                    "source": source_filename,
+                    "page": page_number
                 })
 
-            start += CHUNK_SIZE - CHUNK_OVERLAP
+            if end >= len(page_text):
+                break
 
-    return chunk_records
+            start = end - CHUNK_OVERLAP
 
-
-# ============================================================
-# STEP 5: LOAD MODEL AND BUILD INDEXES
-# ============================================================
-
-print("Loading RAG resources...")
-
-model = SentenceTransformer("all-MiniLM-L6-v2")
-
-chunk_records = []
-bm25 = None
-index = None
+    return records
 
 
-def rebuild_indexes():
+def get_all_records():
 
-    global chunk_records
-    global bm25
-    global index
-
-    print("Rebuilding document indexes...")
-
-    all_records = []
+    records = []
 
     if PDF_PATH.exists():
-
-        records = create_chunks(
-            PDF_PATH,
-            PDF_PATH.name
+        records.extend(
+            create_chunks(PDF_PATH, PDF_PATH.name)
         )
-
-        all_records.extend(records)
 
     for pdf_path in sorted(UPLOAD_DIR.glob("*.pdf")):
 
-        records = create_chunks(
-            pdf_path,
-            pdf_path.name
+        records.extend(
+            create_chunks(pdf_path, pdf_path.name)
         )
 
-        all_records.extend(records)
-
-    if not all_records:
+    if not records:
         raise ValueError("No readable PDF documents found!")
 
-    for chunk_id, record in enumerate(all_records):
+    for chunk_id, record in enumerate(records):
         record["chunk_id"] = chunk_id
 
-    chunk_records = all_records
+    return records
 
-    normalized_chunks = [
-        normalize_text(record["text"])
-        for record in chunk_records
-    ]
 
-    # BM25 INDEX
+# ============================================================
+# STEP 6: BUILD BM25 INDEX
+# ============================================================
+
+def build_bm25():
+    global bm25
 
     tokenized_chunks = [
-        tokenize(chunk)
-        for chunk in normalized_chunks
+        tokenize(record["text"])
+        for record in chunk_records
     ]
 
     bm25 = BM25Okapi(tokenized_chunks)
 
-    print("BM25 index created successfully!")
 
-    # FAISS INDEX
+# ============================================================
+# STEP 7: SAVE INDEX METADATA
+# ============================================================
 
-    embeddings = model.encode(
-        normalized_chunks,
-        convert_to_numpy=True,
-        normalize_embeddings=True
+def save_records():
+
+    with open(RECORDS_PATH, "w", encoding="utf-8") as file:
+
+        json.dump(
+            chunk_records,
+            file,
+            ensure_ascii=False
+        )
+
+
+# ============================================================
+# STEP 8: LOAD SAVED INDEX
+# ============================================================
+
+def load_saved_index():
+
+    global index, chunk_records
+
+    if not INDEX_PATH.exists() or not RECORDS_PATH.exists():
+        return False
+
+    try:
+
+        with open(RECORDS_PATH, "r", encoding="utf-8") as file:
+            records = json.load(file)
+
+        loaded_index = faiss.read_index(
+            str(INDEX_PATH)
+        )
+
+        if not records:
+            return False
+
+        if loaded_index.ntotal != len(records):
+            return False
+
+        chunk_records = records
+        index = loaded_index
+
+        build_bm25()
+
+        print("Existing FAISS index loaded.")
+        print("Total chunks:", len(chunk_records))
+
+        return True
+
+    except Exception as error:
+
+        print("Saved index loading failed:", error)
+
+        index = None
+        bm25 = None
+        chunk_records = []
+
+        return False
+
+
+# ============================================================
+# STEP 9: REBUILD INDEXES IN SMALL BATCHES
+# ============================================================
+
+def rebuild_indexes():
+
+    global index, chunk_records
+
+    print("Reading PDF documents...")
+
+    records = get_all_records()
+
+    embedding_model = get_model()
+
+    new_index = None
+
+    normalized_chunks = [
+        normalize_text(record["text"])
+        for record in records
+    ]
+
+    print("Generating embeddings in batches...")
+
+    for start in range(0, len(normalized_chunks), BATCH_SIZE):
+
+        batch = normalized_chunks[
+            start:start + BATCH_SIZE
+        ]
+
+        embeddings = embedding_model.encode(
+            batch,
+            batch_size=BATCH_SIZE,
+            show_progress_bar=False,
+            convert_to_numpy=True,
+            normalize_embeddings=True
+        )
+
+        embeddings = np.ascontiguousarray(
+            embeddings,
+            dtype="float32"
+        )
+
+        if new_index is None:
+
+            new_index = faiss.IndexFlatIP(
+                embeddings.shape[1]
+            )
+
+        new_index.add(embeddings)
+
+        del embeddings
+
+    if new_index is None:
+        raise ValueError("No embeddings generated.")
+
+    chunk_records = records
+    index = new_index
+
+    build_bm25()
+
+    faiss.write_index(
+        index,
+        str(INDEX_PATH)
     )
 
-    embeddings = np.asarray(
-        embeddings,
-        dtype="float32"
-    )
+    save_records()
 
-    embeddings = np.ascontiguousarray(embeddings)
+    gc.collect()
 
-    index = faiss.IndexFlatIP(
-        embeddings.shape[1]
-    )
-
-    index.add(embeddings)
-
-    faiss.write_index(index, str(INDEX_PATH))
-
-    print("FAISS index created successfully!")
+    print("FAISS and BM25 indexes built successfully.")
     print("Total indexed chunks:", len(chunk_records))
 
-    indexed_files = {
-        record["filename"]
-        for record in chunk_records
-    }
 
-    print("Total indexed PDFs:", len(indexed_files))
+# ============================================================
+# STEP 10: INITIALIZE INDEXES
+# ============================================================
+
+def initialize_indexes():
+
+    if index is not None and bm25 is not None:
+        return
+
+    if not load_saved_index():
+        rebuild_indexes()
 
 
 # ============================================================
-# STEP 6: ADD UPLOADED PDF
+# STEP 11: ADD UPLOADED PDF
 # ============================================================
 
-def add_uploaded_pdf(pdf_path: Path):
+def add_uploaded_pdf(file_path):
 
-    if not pdf_path.exists():
-        raise FileNotFoundError("Uploaded PDF does not exist.")
+    file_path = Path(file_path)
 
-    if pdf_path.suffix.lower() != ".pdf":
-        raise ValueError("Only PDF documents are supported.")
+    if file_path.suffix.lower() != ".pdf":
+        raise ValueError("Only PDF files are supported.")
 
-    test_pdf = PdfReader(str(pdf_path))
+    reader = PdfReader(str(file_path))
 
-    if len(test_pdf.pages) == 0:
-        raise ValueError("The uploaded PDF is empty.")
-
-    if not any(page.extract_text() for page in test_pdf.pages):
-        raise ValueError(
-            "No selectable text found in this PDF. "
-            "Scanned PDFs require OCR."
-        )
+    if len(reader.pages) == 0:
+        raise ValueError("Uploaded PDF is empty.")
 
     rebuild_indexes()
 
     return {
-        "filename": pdf_path.name,
-        "total_chunks": len(chunk_records),
-        "status": "indexed"
+        "message": "PDF uploaded and indexes rebuilt successfully.",
+        "filename": file_path.name,
+        "total_chunks": len(chunk_records)
     }
 
 
 # ============================================================
-# STEP 7: LIST INDEXED DOCUMENTS
+# STEP 12: LIST INDEXED DOCUMENTS
 # ============================================================
 
 def list_indexed_documents():
+
+    # Ensure indexes and records are loaded first
+    initialize_indexes()
 
     documents = {}
 
     for record in chunk_records:
 
-        filename = record["filename"]
+        filename = record.get("source", "Unknown")
+        page = record.get("page", 0)
 
         if filename not in documents:
 
             documents[filename] = {
                 "filename": filename,
+                "chunks": 0,
                 "pages": set()
             }
 
-        documents[filename]["pages"].add(
-            record["page"]
-        )
+        documents[filename]["chunks"] += 1
+
+        documents[filename]["pages"].add(page)
 
     return [
         {
-            "filename": item["filename"],
-            "indexed_pages": len(item["pages"])
+            "filename": filename,
+            "chunks": details["chunks"],
+            "indexed_pages": len(details["pages"])
         }
-        for item in documents.values()
+        for filename, details in documents.items()
     ]
 
 
-# BUILD INDEXES WHEN BACKEND STARTS
-
-rebuild_indexes()
-
-
 # ============================================================
-# STEP 8: QUESTION CLASSIFICATION
+# STEP 13: QUESTION CLASSIFICATION
 # ============================================================
 
-def classify_question(question: str):
+def classify_question(question):
 
-    prompt = f"""
-Classify the question into exactly one category.
-
-COLLEGE:
-College regulations, attendance, examinations,
-student records, fees and college documents.
-
-PROFILE:
-Questions about Madhu, Sneha, their personal details,
-education, careers, personality or relationship.
-
-GENERAL:
-General knowledge, AI, programming, science,
-technology and educational questions.
-
-MIXED:
-Questions requiring information from multiple sources.
-
-Return only one word:
-COLLEGE, PROFILE, GENERAL, or MIXED.
-
-Question: {question}
-"""
-
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {"role": "user", "content": prompt}
-        ],
-        temperature=0
+    prompt = (
+        "Classify this question. Return only CODE or GENERAL. "
+        "CODE means programming, debugging, or implementation. "
+        "GENERAL means everything else.\n"
+        f"Question: {question}"
     )
 
-    category = (
-        response.choices[0].message.content or ""
-    ).strip().upper()
+    try:
 
-    allowed = [
-        "COLLEGE",
-        "PROFILE",
-        "GENERAL",
-        "MIXED"
-    ]
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0,
+            max_tokens=5
+        )
 
-    if category not in allowed:
+        result = response.choices[0].message.content or ""
+
+        return (
+            "CODE"
+            if "CODE" in result.upper()
+            else "GENERAL"
+        )
+
+    except Exception as error:
+
+        print("Classification error:", error)
+
         return "GENERAL"
 
-    return category
 
+def is_code_question(question):
 
-# ============================================================
-# STEP 9: CODE QUESTION DETECTION
-# ============================================================
-
-def is_code_question(question: str):
-
-    q = question.lower().strip()
-
-    code_patterns = [
-
-        r"\bwrite\s+(me\s+)?(some\s+)?code\b",
-        r"\bgive\s+(me\s+)?(the\s+)?code\b",
-        r"\bgenerate\s+(the\s+)?code\b",
-        r"\bprovide\s+(the\s+)?code\b",
-        r"\bshow\s+(me\s+)?(the\s+)?code\b",
-
-        r"\b(write|create|generate|give|provide)\s+(me\s+)?(a\s+)?(python|java|javascript|typescript|sql|html|css|c\+\+|c#)\s+code\b",
-
-        r"\b(write|create|generate)\s+(a|an)\s+(python|java|javascript|typescript)\s+(program|script|function)\b",
-
-        r"\bcode\s+to\s+\w+",
-        r"\bprogram\s+to\s+\w+",
-        r"\bfunction\s+to\s+\w+",
-        r"\bscript\s+to\s+\w+",
-
-        r"\busing\s+(python|java|javascript|typescript|sql)\b",
-
-        r"\bcreate\s+(a|an)\s+(function|class|program|script|component|api)\b",
-
-        r"\bimplement\b",
-        r"\bcode\s+only\b",
-        r"\bonly\s+code\b",
-        r"\bfull\s+code\b",
-        r"\bcomplete\s+code\b",
-
-        r"\bfix\s+(this\s+)?code\b",
-        r"\bdebug\s+(this\s+)?code\b",
-        r"\bmodify\s+(this\s+)?code\b",
-        r"\bupdate\s+(this\s+)?code\b",
-
-        r"\bwrite\s+(a\s+)?sql\s+query\b",
-        r"\bgive\s+(me\s+)?(a\s+)?sql\s+query\b",
-
-        r"\b(build|create|write)\s+(a|an)\s+(website|application|api|component)\b"
+    patterns = [
+        r"\b(code|coding|programming|python|java|javascript)\b",
+        r"\b(function|class|algorithm|debug|exception|syntax)\b",
+        r"\b(api|fastapi|react|sql|html|css|docker)\b",
+        r"\b(implement|write a script|write code|fix this code)\b"
     ]
 
     return any(
-        re.search(pattern, q)
-        for pattern in code_patterns
+        re.search(pattern, question, re.IGNORECASE)
+        for pattern in patterns
     )
 
 
-# ============================================================
-# STEP 10: CLEAN CODE RESPONSE
-# ============================================================
+def clean_code_response(response):
 
-def clean_code_response(answer: str):
+    if not response:
+        return response
 
-    answer = answer.strip()
-
-    if not answer:
-        return answer
-
-    # Extract the first Markdown code block if present.
-
-    code_block = re.search(
-        r"```(?:python|py|java|javascript|js|typescript|ts|sql|html|css|c\+\+|c#)?\s*\n(.*?)```",
-        answer,
-        flags=re.IGNORECASE | re.DOTALL
+    match = re.search(
+        r"```(?:[\w+-]+)?\s*([\s\S]*?)```",
+        response
     )
 
-    if code_block:
-        return code_block.group(1).strip()
+    if match:
+        return match.group(1).strip()
 
-    # Remove conversational introductions when no
-    # Markdown code block is present.
-
-    lines = answer.splitlines()
-
-    code_starters = (
-        "import ",
-        "from ",
-        "def ",
-        "class ",
-        "if ",
-        "for ",
-        "while ",
-        "try:",
-        "with ",
-        "const ",
-        "let ",
-        "var ",
-        "function ",
-        "public ",
-        "private ",
-        "SELECT ",
-        "#include",
-        "print(",
-        "return ",
-        "async ",
-        "export "
-    )
-
-    start_index = None
-
-    for i, line in enumerate(lines):
-
-        stripped = line.strip()
-
-        if stripped.startswith(code_starters):
-            start_index = i
-            break
-
-    if start_index is not None:
-        answer = "\n".join(lines[start_index:]).strip()
-
-    return answer
+    return response.strip()
 
 
 # ============================================================
-# STEP 11: HYBRID RETRIEVAL
+# STEP 14: HYBRID RETRIEVAL - FAISS + BM25
 # ============================================================
 
-def retrieve_context(question: str):
+def retrieve_context(question):
 
-    query = normalize_text(question)
+    initialize_indexes()
 
-    # SEMANTIC SEARCH
+    normalized_question = normalize_text(question)
 
-    query_embedding = model.encode(
-        [query],
+    question_embedding = get_model().encode(
+        [normalized_question],
+        batch_size=1,
+        show_progress_bar=False,
         convert_to_numpy=True,
         normalize_embeddings=True
     )
 
-    query_embedding = np.asarray(
-        query_embedding,
+    question_embedding = np.ascontiguousarray(
+        question_embedding,
         dtype="float32"
     )
 
-    query_embedding = np.ascontiguousarray(
-        query_embedding
+    k = min(
+        TOP_K * 3,
+        len(chunk_records)
     )
 
-    semantic_k = min(5, len(chunk_records))
-
-    semantic_scores, semantic_indices = index.search(
-        query_embedding,
-        semantic_k
+    semantic_scores, semantic_ids = index.search(
+        question_embedding,
+        k
     )
 
     semantic_score_map = {}
 
-    for idx, score in zip(
-        semantic_indices[0],
-        semantic_scores[0]
+    for score, chunk_id in zip(
+        semantic_scores[0],
+        semantic_ids[0]
     ):
 
-        if idx != -1:
-            semantic_score_map[int(idx)] = float(score)
+        if chunk_id >= 0:
+            semantic_score_map[int(chunk_id)] = float(score)
 
-    # KEYWORD SEARCH
-
-    query_tokens = tokenize(query)
-
-    keyword_scores = bm25.get_scores(query_tokens)
-
-    keyword_results = []
-
-    for idx, score in enumerate(keyword_scores):
-
-        if score > 0:
-            keyword_results.append((idx, float(score)))
-
-    keyword_results.sort(
-        key=lambda item: item[1],
-        reverse=True
+    bm25_scores = bm25.get_scores(
+        tokenize(question)
     )
 
-    keyword_results = keyword_results[:5]
+    bm25_ids = np.argsort(bm25_scores)[::-1][:k]
 
-    keyword_score_map = {
-        idx: score
-        for idx, score in keyword_results
-    }
+    combined_scores = {}
 
-    # RECIPROCAL RANK FUSION
+    # Semantic ranking
+    for rank, chunk_id in enumerate(semantic_ids[0]):
 
-    fused_scores = {}
+        if chunk_id >= 0:
 
-    semantic_results = sorted(
-        semantic_score_map.items(),
-        key=lambda item: item[1],
-        reverse=True
-    )
+            combined_scores[int(chunk_id)] = (
+                combined_scores.get(int(chunk_id), 0)
+                + 1 / (60 + rank + 1)
+            )
 
-    for rank, (chunk_id, score) in enumerate(
-        semantic_results,
-        start=1
-    ):
+    # Keyword ranking
+    for rank, chunk_id in enumerate(bm25_ids):
 
-        fused_scores[chunk_id] = (
-            fused_scores.get(chunk_id, 0)
-            + 1 / (60 + rank)
+        combined_scores[int(chunk_id)] = (
+            combined_scores.get(int(chunk_id), 0)
+            + 1 / (60 + rank + 1)
         )
 
-    for rank, (chunk_id, score) in enumerate(
-        keyword_results,
-        start=1
-    ):
-
-        fused_scores[chunk_id] = (
-            fused_scores.get(chunk_id, 0)
-            + 1 / (60 + rank)
-        )
-
-    # RANK RESULTS
-
-    ranked_chunks = sorted(
-        fused_scores.items(),
-        key=lambda item: item[1],
+    ranked_ids = sorted(
+        combined_scores,
+        key=combined_scores.get,
         reverse=True
     )
 
-    # FILTER IRRELEVANT RESULTS
+    retrieved = []
 
-    relevant_chunks = []
-
-    for chunk_id, rrf_score in ranked_chunks:
+    for chunk_id in ranked_ids:
 
         semantic_score = semantic_score_map.get(
-            chunk_id, 0.0
+            chunk_id,
+            0.0
         )
 
-        keyword_score = keyword_score_map.get(
-            chunk_id, 0.0
-        )
-
-        has_keyword_match = keyword_score > 0
-
-        is_relevant = (
+        if (
             semantic_score >= MIN_SEMANTIC_SCORE
-            and (
-                has_keyword_match
-                or semantic_score >= STRONG_SEMANTIC_SCORE
-            )
-        )
+            or not retrieved
+        ):
 
-        print(
-            f"Chunk {chunk_id}: "
-            f"Semantic={semantic_score:.4f}, "
-            f"BM25={keyword_score:.4f}, "
-            f"RRF={rrf_score:.6f}, "
-            f"Relevant={is_relevant}"
-        )
+            record = chunk_records[chunk_id]
 
-        if is_relevant:
-
-            relevant_chunks.append({
-                "chunk_id": chunk_id,
-                "rrf_score": rrf_score,
-                "semantic_score": semantic_score,
-                "keyword_score": keyword_score
+            retrieved.append({
+                **record,
+                "semantic_score": semantic_score
             })
 
-    # SELECT TOP RELEVANT CHUNKS
+        if len(retrieved) >= TOP_K:
+            break
 
-    selected_chunks = relevant_chunks[:TOP_K]
+    return retrieved
 
-    retrieved_chunks = []
-    source_details = []
 
-    for result in selected_chunks:
+# ============================================================
+# STEP 15: STUDENT PROFILE CONTEXT
+# ============================================================
 
-        chunk_id = result["chunk_id"]
+def get_profile_context(question):
 
-        record = chunk_records[chunk_id]
+    if not profile_data:
+        return ""
 
-        retrieved_chunks.append(record["text"])
+    question_lower = question.lower()
 
-        source_details.append({
-            "chunk_id": record["chunk_id"],
-            "filename": record["filename"],
-            "page": record["page"],
-            "retrieval_score": round(
-                float(result["rrf_score"]), 6
-            ),
-            "semantic_score": round(
-                float(result["semantic_score"]), 4
-            ),
-            "keyword_score": round(
-                float(result["keyword_score"]), 4
-            ),
-            "text": record["text"]
-        })
+    matches = []
 
-    # RETRIEVAL STATUS
+    for key, value in profile_data.items():
 
-    if source_details:
-        retrieval_status = "matched"
-    else:
-        retrieval_status = "no_relevant_context"
+        name = ""
 
-    print("Semantic results:", list(semantic_score_map.keys()))
+        if isinstance(value, dict):
+            name = str(
+                value.get("name", "")
+            ).lower()
 
-    print("Keyword results:", [
-        idx for idx, score in keyword_results
-    ])
+        if (
+            key.lower() in question_lower
+            or (name and name in question_lower)
+        ):
 
-    print("Selected chunks:", [
-        item["chunk_id"] for item in source_details
-    ])
+            matches.append(
+                json.dumps(
+                    value,
+                    ensure_ascii=False
+                )
+            )
 
-    print("Source files:", [
-        item["filename"] for item in source_details
-    ])
+    return "\n".join(matches)
 
-    print("Source pages:", [
-        item["page"] for item in source_details
-    ])
 
-    print("Retrieval status:", retrieval_status)
+# ============================================================
+# STEP 16: GENERATE ANSWER USING GROQ
+# ============================================================
 
-    return (
-        retrieved_chunks,
-        source_details,
-        retrieval_status
+def ask_question(question):
+
+    question = question.strip()
+
+    if not question:
+        raise ValueError("Question cannot be empty.")
+
+    question_type = (
+        "CODE"
+        if is_code_question(question)
+        else classify_question(question)
     )
 
+    retrieved_chunks = retrieve_context(question)
 
-# ============================================================
-# STEP 12: GENERATE ANSWER
-# ============================================================
-
-def ask_question(question: str):
-
-    # DETECT CODE MODE
-
-    code_mode = is_code_question(question)
-
-    print("\n========== NEW QUESTION ==========")
-    print("Question:", question)
-    print("Code-only mode:", code_mode)
-
-    # CLASSIFY QUESTION
-
-    category = classify_question(question)
-
-    print("Question category:", category)
-
-    retrieved_chunks = []
-    source_details = []
-    retrieval_status = "not_applicable"
-
-    # RETRIEVE COLLEGE INFORMATION
-
-    if category in ["COLLEGE", "MIXED"]:
-
+    context = "\n\n".join(
         (
-            retrieved_chunks,
-            source_details,
-            retrieval_status
-        ) = retrieve_context(question)
-
-    # PREPARE COLLEGE CONTEXT
-
-    context_parts = []
-
-    for source in source_details:
-
-        context_parts.append(
-            f"""
-[Source File: {source["filename"]}]
-[PDF Page: {source["page"]}]
-[Chunk ID: {source["chunk_id"]}]
-
-{source["text"]}
-"""
+            f"Source: {item['source']} | Page: {item['page']}\n"
+            f"{item['text']}"
         )
+        for item in retrieved_chunks
+    )
 
-    context = "\n\n".join(context_parts)
+    profile_context = get_profile_context(question)
 
-    # PREPARE PROFILE CONTEXT
+    if profile_context:
 
-    if category in ["PROFILE", "MIXED"]:
-
-        profile_context = json.dumps(
-            PROFILE_DATA,
-            indent=2,
-            ensure_ascii=False
+        context += (
+            "\n\nRelevant student profile information:\n"
+            + profile_context
         )
-
-    else:
-        profile_context = ""
-
-    # RESPONSE INSTRUCTIONS
-
-    if code_mode:
-
-        system_prompt = """
-You are CampusAI, a programming assistant.
-
-STRICT CODE-ONLY MODE.
-
-Return exactly one solution.
-
-Rules:
-
-1. Return source code only.
-2. Generate simple beginner-friendly code.
-3. Do not write an introduction.
-4. Do not explain the code.
-5. Do not add headings.
-6. Do not use Markdown fences.
-7. Do not add conclusions.
-8. Do not generate alternative solutions.
-9. Do not add unnecessary imports.
-10. Do not add command-line argument handling unless requested.
-11. Do not add unnecessary error handling.
-12. Do not add unnecessary classes.
-13. Do not over-engineer simple tasks.
-14. Include a simple function call or example when useful.
-15. Follow the exact programming language requested.
-
-For a simple programming question, prefer the shortest
-clear and correct implementation.
-
-Your entire response must be source code only.
-"""
-
-        response_instructions = """
-CODE-ONLY MODE:
-
-Return only one simple, correct code solution.
-
-No introductions.
-No explanations.
-No headings.
-No Markdown fences.
-No alternatives.
-No conclusions.
-
-Keep the implementation beginner-friendly.
-"""
-
-        temperature = 0.1
-
-    else:
-
-        system_prompt = """
-You are CampusAI, a friendly, intelligent,
-natural and conversational AI assistant.
-
-Answer questions clearly and accurately.
-
-Follow the source restrictions and response instructions
-provided in the user's message.
-"""
-
-        response_instructions = """
-NORMAL RESPONSE MODE:
-
-Answer naturally and conversationally.
-
-Use clear explanations and examples when useful.
-
-Answer directly and keep simple answers short.
-
-Use more detail when requested.
-"""
-
-        temperature = 0.4
-
-    # BUILD PROMPT
 
     prompt = f"""
-QUESTION CATEGORY:
-{category}
+You are CampusAI, an intelligent College Assistant.
 
-COLLEGE DOCUMENT CONTEXT:
-{context}
+You have access to:
+1. Retrieved college document context.
+2. General knowledge as an AI language model.
+3. Relevant student profile information, when available.
 
-PERSONAL PROFILE:
-{profile_context}
+RULE 1:
+For college-specific questions about regulations, attendance,
+student records, examinations, and college policies, use the
+provided document context as the source of official information.
 
-USER QUESTION:
+RULE 2:
+If college-specific information is missing from the retrieved context,
+clearly say that it is not available in the uploaded documents.
+You may then provide a clearly labelled general explanation.
+
+RULE 3:
+For general educational and technical questions, use your general
+knowledge and explain clearly.
+
+RULE 4:
+Never present general knowledge as an official college rule.
+
+RULE 5:
+Use student profile information only when relevant to the question.
+Do not invent personal details or make insulting claims about people.
+
+RULE 6:
+For programming questions, provide accurate, beginner-friendly
+answers and complete code when requested.
+
+Retrieved Document and Profile Context:
+{context if context else "No relevant document context found."}
+
+User Question:
 {question}
 
-IMPORTANT INSTRUCTIONS:
-
-1. COLLEGE QUESTIONS:
-
-Use college document context for official college facts.
-
-Never invent rules or percentages.
-
-If no relevant college document context is provided,
-do not guess or use general knowledge for official
-college rules.
-
-Clearly say that the information could not be found
-in the uploaded document.
-
-2. PERSONAL QUESTIONS:
-
-Use the personal profile as the source of truth.
-
-Understand different wording and indirect references.
-
-Combine information when appropriate.
-
-3. FUNNY QUESTIONS:
-
-Use the funny_responses and humor_guidelines
-sections in the personal profile.
-
-Understand the user's intention even when the exact
-question is not listed in the triggers.
-
-Use natural, playful, affectionate humor.
-
-You can generate new jokes inspired by the profile.
-
-Do not simply repeat the same predefined response.
-
-4. RELATIONSHIP QUESTIONS:
-
-Madhu and Sneha are romantic partners who hope
-to get married in the future.
-
-Answer warmly and naturally.
-
-Never claim they are already married or engaged.
-
-5. GENERAL QUESTIONS:
-
-Use your general knowledge.
-
-Explain concepts clearly and use examples when useful.
-
-6. MIXED QUESTIONS:
-
-Combine relevant sources without confusing
-official facts, personal facts and general knowledge.
-
-If college context is missing, do not invent
-college-related information.
-
-7. SOURCE ACCURACY:
-
-Use the supplied PDF context for college facts.
-
-Use the exact source filename and page number
-when identifying document sources.
-
-Never invent PDF page numbers or source filenames.
-
-If the context does not support the answer,
-say the information is not available in the document.
-
-8. RESPONSE FORMAT:
-
-{response_instructions}
-
-Now answer the user's question.
+Answer:
 """
 
-    # CALL GROQ
+    try:
 
-    response = client.chat.completions.create(
-        model=GROQ_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": system_prompt
-            },
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ],
-        temperature=temperature
-    )
+        response = client.chat.completions.create(
+            model=GROQ_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": prompt
+                }
+            ],
+            temperature=0.2,
+            max_tokens=1500
+        )
 
-    answer = response.choices[0].message.content or ""
+        answer = (
+            response.choices[0].message.content or ""
+        )
 
-    # CLEAN CODE RESPONSE
+        if question_type == "CODE":
+            answer = clean_code_response(answer)
 
-    if code_mode:
-        answer = clean_code_response(answer)
+        return {
+            "answer": answer,
+            "sources": [
+                {
+                    "filename": item["source"],
+                    "page": item["page"],
+                    "score": round(
+                        item["semantic_score"],
+                        4
+                    )
+                }
+                for item in retrieved_chunks
+            ]
+        }
 
-    print("Final code mode:", code_mode)
+    except Exception as error:
 
-    # RETURN RESPONSE
+        print("Groq API request failed:", error)
 
-    return {
-        "answer": answer.strip(),
-        "sources": retrieved_chunks,
-        "source_details": source_details,
-        "retrieval_status": retrieval_status
-    }
+        raise
+
+
+# ============================================================
+# STEP 17: INITIALIZE PROFILE
+# ============================================================
+
+load_profile()
+
+print("CampusAI RAG engine initialized successfully.")
+print("Embedding model and indexes will load when first needed.")
