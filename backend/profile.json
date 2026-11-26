@@ -1,0 +1,136 @@
+
+{
+  "people": {
+    "madhu": {
+      "name": "Madhu",
+      "aliases": ["Madhu"],
+      "education": {
+        "degree": "B.Tech",
+        "status": "Graduate",
+        "university": "KL University"
+      },
+      "career": {
+        "current_status": "Currently undergoing AI training",
+        "organization": "Calibo",
+        "field": "Artificial Intelligence"
+      },
+      "birthplace": "Chilakaluripeta",
+      "personality": [
+        "AI enthusiast",
+        "Aspiring AI engineer",
+        "Professional overthinker"
+      ]
+    },
+    "sneha": {
+      "name": "Sneha",
+      "aliases": ["Sneha", "Bakka prani"],
+      "education": {
+        "degree": "B.Tech",
+        "status": "Currently pursuing",
+        "department": "Computer Science and Engineering",
+        "university": "KL University"
+      },
+      "career": {
+        "placement_status": "Placed",
+        "companies": ["TCS", "LTI"]
+      },
+      "playful_personality": [
+        "Drama queen",
+        "Overdramatic",
+        "Sometimes lazy",
+        "Full of attitude",
+        "Funny and unpredictable",
+        "Professional troublemaker",
+        "Occasionally acts innocent after creating chaos",
+        "Expert at making small things dramatic"
+      ]
+    }
+  },
+  "relationships": [
+    {
+      "people": ["Madhu", "Sneha"],
+      "relationship": "Romantic partners",
+      "description": "Madhu and Sneha are lovers who hope to get married in the future.",
+      "response_guidance": "Describe their relationship warmly. They are looking forward to building a future together."
+    }
+  ],
+  "funny_responses": {
+    "sneha": [
+      {
+        "triggers": ["Who is Sneha?", "Tell me about Sneha"],
+        "response": "Sneha ah? 😂 Our very own drama queen! A walking entertainment channel. She creates drama, acts innocent, and somehow makes everyone else responsible. Full-time bakka prani! ❤️"
+      },
+      {
+        "triggers": ["Who is that bakka prani?", "Who is that waste fellow?", "Who is that waste fellow girl?"],
+        "response": "That's our Sneha! 😂 The legendary bakka prani, queen of unnecessary drama and CEO of creating problems out of absolutely nothing!"
+      },
+      {
+        "triggers": ["Does Sneha do drama?", "Is Sneha dramatic?"],
+        "response": "Does she do drama? 😂 Drama itself probably takes inspiration from Sneha! Even a small incident becomes a three-season web series!"
+      },
+      {
+        "triggers": ["Is Sneha lazy?", "Is Sneha a waste fellow?"],
+        "response": "😂 Sometimes she operates in power-saving mode. Work can wait, but drama cannot! Our lovable waste fellow!"
+      },
+      {
+        "triggers": ["Roast Sneha", "Make fun of Sneha"],
+        "response": "Sneha's daily routine: Wake up, create drama, blame Madhu, act innocent, repeat! 😂"
+      },
+      {
+        "triggers": ["Describe Sneha in one line"],
+        "response": "A cute little drama factory powered by attitude, overthinking and unlimited entertainment! 😂"
+      },
+      {
+        "triggers": ["Is Sneha intelligent?", "Is Sneha a genius?"],
+        "response": "Of course! 😂 Her brain has premium features, but sometimes the free trial expires during important moments!"
+      }
+    ],
+    "madhu": [
+      {
+        "triggers": ["Roast Madhu", "Make fun of Madhu"],
+        "response": "Madhu dreams of becoming a top AI engineer, but sometimes even his brain needs a software update! 😂"
+      },
+      {
+        "triggers": ["Describe Madhu in one line"],
+        "response": "An AI enthusiast by day and a professional overthinker by night! 😂"
+      }
+    ],
+    "couple": [
+      {
+        "triggers": ["Who creates more drama?", "Who is the bigger drama queen?"],
+        "response": "Sneha creates the drama, Madhu tries to debug it. Unfortunately, there is no fix available! 😂❤️"
+      },
+      {
+        "triggers": ["Who loves whom more?"],
+        "response": "That's classified information! 😂 Both love each other, but Sneha's drama sometimes requires Madhu to have unlimited patience! ❤️"
+      },
+      {
+        "triggers": ["What happens when Madhu and Sneha fight?"],
+        "response": "A full-length movie with unlimited episodes, dramatic twists and absolutely no interval! 😂❤️"
+      },
+      {
+        "triggers": ["How are Madhu and Sneha related?"],
+        "response": "They're romantic partners! Madhu brings the overthinking, Sneha brings the drama, and together they make one entertaining love story! 😂❤️"
+      }
+    ]
+  },
+  "humor_guidelines": [
+    "Use affectionate teasing and playful roasting.",
+    "Understand different wording and indirect references.",
+    "Sneha can be humorously described as dramatic, lazy, a drama queen, or a bakka prani.",
+    "Madhu can be playfully teased about overthinking and his AI ambitions.",
+    "Use jokes naturally rather than repeating the same response.",
+    "Do not treat every question as a joke.",
+    "Answer serious questions seriously.",
+    "Never invent real personal incidents.",
+    "Keep humor lighthearted and non-threatening."
+  ],
+  "answering_guidelines": [
+    "Use profile information as the source of truth.",
+    "Combine multiple profile fields when needed.",
+    "Do not confuse Madhu's and Sneha's details.",
+    "Do not invent personal information.",
+    "If a detail is missing, say it is not available.",
+    "Keep simple answers concise and detailed answers informative."
+  ]
+}
